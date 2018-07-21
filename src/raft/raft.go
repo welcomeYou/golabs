@@ -23,7 +23,13 @@ import "labrpc"
 // import "bytes"
 // import "encoding/gob"
 
-
+// 
+// log entry contains command for state machine, and term when entry
+// was received by leader
+type LogEntry struct {
+    Command interface{}
+    Term    int
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -35,6 +41,20 @@ type ApplyMsg struct {
 	Command     interface{}
 	UseSnapshot bool   // ignore for lab2; only used in lab3
 	Snapshot    []byte // ignore for lab2; only used in lab3
+}
+
+type AppendEntryArgs struct {
+        term int
+        leaderId int
+        prevLogIndex int
+        prevLogTerm int
+        entries []LogEntry
+        leaderCommit int
+}
+
+type AppendEntryReply struct {
+        term int
+        success bool 
 }
 
 //
@@ -50,6 +70,28 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+    // Persistent state on all servers
+    currentTerm int
+    votedFor    int
+    logs        []LogEntry
+
+    // Volatile state on all servers
+    commitIndex int
+    lastApplied int
+
+    // Volatile state on leaders
+    nextIndex   []int
+    matchIndex  []int
+
+    // Num. of granted votes
+    numGrantedVote  int
+
+    // State and applyMsg chan
+    state   string
+    applyCh     chan    ApplyMsg
+
+    // Timer
+    timer *timer.Timer
 }
 
 // return currentTerm and whether this server
@@ -102,6 +144,11 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+    term int
+    candidateId int
+    lastLogIndex int
+    lastLogTerm int
+
 }
 
 //
@@ -110,6 +157,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+    term int
+    voteGranted bool
 }
 
 //
@@ -117,8 +166,54 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-}
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
 
+    mayGrantVote := true
+
+    // if current server is more newer than candidate
+    if len(rf.logs) > 0 {
+            if rf.logs[len(rf.logs) - 1].Term > args.lastLogTerm ||
+            (rf.logs[len(rf.logs) - 1].Term == args.term && len(rf.logs) > args.lastLogIndex) {
+                    mayGrantVote = false
+            }
+}
+    if args.term < rf.currentTerm {
+            reply.mayGrantVote = false
+            reply.term = rf.currentTerm
+            return
+    }
+
+    if args.term == rf.currentTerm {
+            if rf.votedFor == -1 &&  mayGrantVote {
+                    rf.votedFor = args.candidateId
+                    rf.persist()
+                    reply.voteGranted = true
+            } else {
+                    reply.voteGranted = false
+            }
+            reply.term = rf.currentTerm
+            return
+    }
+
+    if args.term > rf.currentTerm {
+            rf.state = FOLLOWER
+            rf.term = args.term
+            rf.votedFor = -1
+
+            if mayGrantVote {
+                    rf.votedFor = args.candidateId
+                    rf.persist()
+            }
+
+            rf.resetTimer()
+
+            reply.term = args.term
+            reply.voteGranted = (rf.votedFor == args.candidateId)
+
+            return 
+    }
+}
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -207,10 +302,99 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+    rf.currentTerm = 0
+    rf.votedFor = -1
+    rf.logs = make([]LogEntry, 0)
+
+    rf.commitIndex = 0
+    rf.lastApplied = 0
+
+    rf.nextIndex = make([]int, 0)
+    rf.matchIndex = make([]int, 0)
+
+    rf.numGrantedVote = 0
+
+    rf.state = FOLLOWER
+    rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+    rf.persist()
+    rf.resetTimer()
 
 	return rf
+}
+
+func (rf *Raft) handleTimer() {
+        rf.mu.Lock()
+        defer rf.mu.Unlock()
+
+        if rf.state != LEADER {
+                rf.state = CANDIDATE
+                rf.currentTerm += 1
+                rf.votedFor = rf.me
+                rf.numGrantedVote = 1
+                rf.persist()
+
+                args := RequestVoteArgs {
+                        term:   rf.currentTerm,
+                        candidateId:    rf.me,
+                        lastLogIndex:   len(rf.logs) - 1,
+                }
+
+                if len(rf.logs) > 0 {
+                        args.lastLogTerm = rf.logs[args.lastLogIndex].term
+                }
+                
+                for server := 0; server < len(rf.peers); server++ {
+                        if server == rf.me {
+                                continue
+                        }
+
+                        go func(server int, args, RequestVoteArgs) {
+                                var reply RequestVoteReply
+                                ok := rf.sendRequestVote(server, args, &reply)
+                                if ok {
+                                        rf.handleVoteResult(reply)
+                                }
+                        }(server, args)
+                }
+        } else {
+                rf.sendHeartBeatToAllFollower()
+        }
+        rf.resetTimer()
+}
+
+
+func (rf *Raft) handleVoteResult(reply RequestVoteReply) {
+        rf.mu.Lock()
+        defer rf.mu.Unlock()
+
+        if reply.term < rf.currentTerm {
+                return
+        }
+
+        if reply.term > rf.currentTerm {
+                rf.state = FOLLOWER
+                rf.votedFor = -1
+                rf.currentTerm = reply.term
+                rf.resetTimer()
+                return
+        }
+
+        if rf.state == CANDIDATE && reply.voteGranted {
+                rf.numGrantedVote += 1
+                if rf.numGrantedVote > majority(len(rf.peers)) {
+                        rf.state = LEADER
+                        for i := 0; i < len(rf.peers); i++ {
+                                if i == rf.me {
+                                        continue
+                                }
+                                rf.nextIndex[i] = len(rf.logs)
+                                rf.matchIndex = -1
+                        }
+                        rf.resetTimer()
+                }
+        }
 }
